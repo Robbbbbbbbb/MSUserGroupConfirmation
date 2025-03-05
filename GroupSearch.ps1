@@ -6,7 +6,49 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
     Write-Host "Microsoft Graph module is not installed. Installing now..." -ForegroundColor Yellow
-    Install-Module Microsoft.Graph -Scope CurrentUser -Force
+    try {
+        Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+        Install-Module Microsoft.Graph -Scope CurrentUser -Force
+    } catch {
+        Write-Host "⚠️ Unable to install Microsoft Graph module. Please install it manually." -ForegroundColor Red
+        exit
+    }
+}
+
+# Function to check if a user and group exist in both AD and Azure AD
+function Verify-UserAndGroup($userEmail, $groupName) {
+    $existsOnPrem = $false
+    $existsAzure = $false
+
+    # Check in On-Prem AD
+    $user = Get-ADUser -Filter {UserPrincipalName -eq $userEmail} -Properties MemberOf
+    $group = Get-ADGroup -Filter {Name -eq $groupName}
+
+    if ($user -and $group) {
+        $existsOnPrem = $true
+    }
+
+    # Check in Azure AD
+    try {
+        Connect-MgGraph -Scopes "User.Read.All", "GroupMember.Read.All" -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "❌ Could not connect to Microsoft Graph. Ensure you have the correct permissions." -ForegroundColor Red
+        Write-Host "Diagnostic Information:" -ForegroundColor Yellow
+        Write-Host "Error Message: $($_.Exception.Message)" -ForegroundColor Yellow
+        exit
+    }
+
+    $userAzure = Get-MgUser -Filter "userPrincipalName eq '$userEmail'"
+    $groupAzure = Get-MgGroup -Filter "displayName eq '$groupName'"
+
+    if ($userAzure -and $groupAzure) {
+        $existsAzure = $true
+    }
+
+    return @{
+        OnPrem  = $existsOnPrem
+        AzureAD = $existsAzure
+    }
 }
 
 # Function to check if a user is a member of a group
@@ -16,24 +58,17 @@ function Check-Membership($userEmail, $groupName) {
 
     # Check in On-Prem AD
     $user = Get-ADUser -Filter {UserPrincipalName -eq $userEmail} -Properties MemberOf
-    if ($user) {
-        $group = Get-ADGroup -Filter {Name -eq $groupName}
-        if ($group) {
-            $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.DistinguishedName -eq $user.DistinguishedName }
-            if ($isMember) { $isMemberOnPrem = $true }
-        }
+    $group = Get-ADGroup -Filter {Name -eq $groupName}
+    if ($user -and $group) {
+        $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.DistinguishedName -eq $user.DistinguishedName }
+        if ($isMember) { $isMemberOnPrem = $true }
     }
 
     # Check in Azure AD
-    try {
-        Connect-MgGraph -Scopes "User.Read.All", "GroupMember.Read.All" -ErrorAction Stop | Out-Null
-        $userAzure = Get-MgUser -Filter "userPrincipalName eq '$userEmail'"
-        $groupAzure = Get-MgGroup -Filter "displayName eq '$groupName'"
-        if ($userAzure -and $groupAzure) {
-            $isMemberAzure = (Get-MgGroupMember -GroupId $groupAzure.Id | Where-Object { $_.Id -eq $userAzure.Id }) -ne $null
-        }
-    } catch {
-        Write-Host "⚠️ Could not connect to Microsoft Graph. Ensure you have the correct permissions." -ForegroundColor Red
+    $userAzure = Get-MgUser -Filter "userPrincipalName eq '$userEmail'"
+    $groupAzure = Get-MgGroup -Filter "displayName eq '$groupName'"
+    if ($userAzure -and $groupAzure) {
+        $isMemberAzure = (Get-MgGroupMember -GroupId $groupAzure.Id | Where-Object { $_.Id -eq $userAzure.Id }) -ne $null
     }
 
     return @{
@@ -42,17 +77,12 @@ function Check-Membership($userEmail, $groupName) {
     }
 }
 
-# Ask user to choose an option
-Write-Host "Select an option:" -ForegroundColor Cyan
-Write-Host "1. Check a single user"
-Write-Host "2. Check multiple users via CSV import"
-$choice = Read-Host "Enter 1 or 2"
-
-if ($choice -eq "1") {
-    # Prompt for the username and domain
-    $upnUsername = Read-Host "Enter the username (UPN without domain, e.g., 'jdoe')"
-    $domain = Read-Host "Enter the domain (e.g., 'test.com')"
-    $groupName = Read-Host "Enter the group name (e.g., 'Service Accounts')"
+# Main menu loop
+do {
+    # Prompt for user input
+    if (-not $upnUsername) { $upnUsername = Read-Host "Enter the username (UPN without domain, e.g., 'jdoe')" }
+    if (-not $domain) { $domain = Read-Host "Enter the domain (e.g., 'test.com')" }
+    if (-not $groupName) { $groupName = Read-Host "Enter the group name (e.g., 'Service Accounts')" }
 
     # Construct the full UPN
     $userEmail = "$upnUsername@$domain"
@@ -64,6 +94,19 @@ if ($choice -eq "1") {
     $confirmation = Read-Host "Is this correct? (Y/N)"
     if ($confirmation -notmatch "^[Yy]$") {
         Write-Host "Exiting script. Please restart and enter correct details." -ForegroundColor Red
+        exit
+    }
+
+    # Verify that both the user and group exist
+    $verification = Verify-UserAndGroup -userEmail $userEmail -groupName $groupName
+    if (-not $verification.OnPrem) {
+        Write-Host "⚠️ User or group does not exist in On-Prem Active Directory." -ForegroundColor Red
+    }
+    if (-not $verification.AzureAD) {
+        Write-Host "⚠️ User or group does not exist in Azure AD." -ForegroundColor Red
+    }
+    if (-not $verification.OnPrem -and -not $verification.AzureAD) {
+        Write-Host "❌ The user or group does not exist in either directory. Exiting." -ForegroundColor Red
         exit
     }
 
@@ -85,50 +128,24 @@ if ($choice -eq "1") {
         Write-Host "❌ User '$userEmail' is NOT a member of '$groupName' in Azure AD (O365)." -ForegroundColor Yellow
     }
 
-} elseif ($choice -eq "2") {
-    # Prompt for CSV file path
-    $csvPath = Read-Host "Enter the full path to the CSV file (e.g., 'C:\Users\Administrator\users.csv')"
-    if (-not (Test-Path $csvPath)) {
-        Write-Host "⚠️ File not found. Please check the path and try again." -ForegroundColor Red
-        exit
+    # Ask the user what they want to do next
+    Write-Host "`nWhat would you like to do next?" -ForegroundColor Cyan
+    Write-Host "1. Run a brand new search"
+    Write-Host "2. Run a new search for the same user in the same domain but a different group"
+    Write-Host "3. Run a new search for a different user in the same group"
+    Write-Host "4. Run a new search for a different user in a different domain but the same group"
+    Write-Host "5. Exit"
+
+    $nextAction = Read-Host "Enter a choice (1-5)"
+
+    switch ($nextAction) {
+        "1" { $upnUsername = $null; $domain = $null; $groupName = $null; continue }
+        "2" { $groupName = Read-Host "Enter the new group name"; continue }
+        "3" { $upnUsername = Read-Host "Enter the new username"; continue }
+        "4" { $domain = Read-Host "Enter the new domain"; continue }
+        "5" { break }
+        default { Write-Host "Invalid choice, exiting." -ForegroundColor Red; break }
     }
-
-    # Prompt for domain and group name
-    $domain = Read-Host "Enter the domain (e.g., 'test.com')"
-    $groupName = Read-Host "Enter the group name (e.g., 'Service Accounts')"
-
-    # Read CSV
-    $users = Import-Csv -Path $csvPath
-    if (-not $users) {
-        Write-Host "⚠️ No data found in the CSV file. Please check the file format." -ForegroundColor Red
-        exit
-    }
-
-    # Process each user
-    $results = @()
-    foreach ($row in $users) {
-        $upnUsername = $row.PSObject.Properties.Value[0]  # Read first column
-        $userEmail = "$upnUsername@$domain"
-
-        Write-Host "Checking $userEmail..." -ForegroundColor Cyan
-        $result = Check-Membership -userEmail $userEmail -groupName $groupName
-        $isMember = if ($result.OnPrem -or $result.AzureAD) { "TRUE" } else { "FALSE" }
-
-        # Store result
-        $results += [PSCustomObject]@{
-            Username         = $upnUsername
-            GroupMembership  = $isMember
-        }
-    }
-
-    # Export results
-    $outputPath = $csvPath -replace "\.csv$", "-Results.csv"
-    $results | Export-Csv -Path $outputPath -NoTypeInformation
-    Write-Host "`n✅ CSV export complete! Results saved to: $outputPath" -ForegroundColor Green
-
-} else {
-    Write-Host "⚠️ Invalid selection. Please restart the script and enter 1 or 2." -ForegroundColor Red
-    exit
-}
+} while ($true)
 
 Write-Host "`nCheck complete!" -ForegroundColor Cyan
